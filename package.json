@@ -1,0 +1,18 @@
+{
+  "name": "daily-tech-briefing",
+  "version": "1.0.0",
+  "description": "Automated daily tech news briefing curated by Gemini and delivered via email",
+  "type": "module",
+  "main": "index.js",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --env-file=.env index.js"
+  },
+  "dependencies": {
+    "nodemailer": "^6.9.16",
+    "rss-parser": "^3.13.0"
+  }
+}
