@@ -13,11 +13,14 @@ const LOOKBACK_MS = LOOKBACK_HOURS * 60 * 60 * 1000;
 const PRUNE_DAYS = 14;
 const PRUNE_MS = PRUNE_DAYS * 24 * 60 * 60 * 1000;
 const FEED_TIMEOUT_MS = 15_000;
-const GEMINI_TIMEOUT_MS = 90_000;
+const GEMINI_TIMEOUT_MS = 120_000;
 const FALLBACK_GEMINI_MODELS = [
+  "gemini-flash-latest",
+  "gemini-3.5-flash",
   "gemini-flash-lite-latest",
   "gemini-3.5-flash-lite",
-  "gemini-3.5-flash",
+  "gemini-3.8-flash",
+  "gemini-3.6-flash",
 ];
 
 const TRACKING_PARAMS = new Set([
@@ -48,6 +51,26 @@ const RSS_FEEDS = [
     source: "Google AI Blog",
     url: "https://blog.google/technology/ai/rss/",
   },
+  {
+    category: "AI & LLM",
+    source: "TechCrunch AI",
+    url: "https://techcrunch.com/category/artificial-intelligence/feed/",
+  },
+  {
+    category: "AI & LLM",
+    source: "The Verge AI",
+    url: "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml",
+  },
+  {
+    category: "AI & LLM",
+    source: "Hugging Face Blog",
+    url: "https://huggingface.co/blog/feed.xml",
+  },
+  {
+    category: "AI & LLM",
+    source: "Ars Technica Tech Lab",
+    url: "https://feeds.arstechnica.com/arstechnica/technology-lab",
+  },
   // Frontend (React & Next.js)
   {
     category: "Frontend: React & Next.js",
@@ -61,6 +84,11 @@ const RSS_FEEDS = [
   },
   {
     category: "Frontend: React & Next.js",
+    source: "Vercel Blog",
+    url: "https://vercel.com/atom",
+  },
+  {
+    category: "Frontend: React & Next.js",
     source: "Dev.to React",
     url: "https://dev.to/feed/tag/react",
   },
@@ -69,7 +97,7 @@ const RSS_FEEDS = [
     source: "Dev.to Next.js",
     url: "https://dev.to/feed/tag/nextjs",
   },
-  // Backend (Node.js)
+  // Backend (Node.js & JS Ecosystem)
   {
     category: "Backend: Node.js & JS Ecosystem",
     source: "Node.js Blog",
@@ -84,6 +112,11 @@ const RSS_FEEDS = [
     category: "Backend: Node.js & JS Ecosystem",
     source: "HN JS/TS",
     url: "https://hnrss.org/newest?q=React+OR+Next.js+OR+Node.js+OR+TypeScript&points=50",
+  },
+  {
+    category: "Backend: Node.js & JS Ecosystem",
+    source: "Hacker News Frontpage",
+    url: "https://hnrss.org/frontpage?points=100",
   },
 ];
 
@@ -195,24 +228,44 @@ function stripHtml(text = "") {
 }
 
 async function fetchFeed(parser, feed) {
-  const response = await fetch(feed.url, {
-    signal: AbortSignal.timeout(FEED_TIMEOUT_MS),
-    headers: {
-      "User-Agent": "daily-tech-briefing/1.0 (+https://github.com)",
-      Accept: "application/rss+xml, application/atom+xml, application/xml, text/xml",
-    },
-  });
+  const maxAttempts = 2;
+  let lastError;
 
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status} ${response.statusText}`);
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const response = await fetch(feed.url, {
+        signal: AbortSignal.timeout(FEED_TIMEOUT_MS),
+        headers: {
+          "User-Agent": "daily-tech-briefing/1.0 (+https://github.com)",
+          Accept:
+            "application/rss+xml, application/atom+xml, application/xml, text/xml",
+        },
+      });
+
+      if (!response.ok) {
+        const err = new Error(`HTTP ${response.status} ${response.statusText}`);
+        if (![429, 500, 502, 503, 504].includes(response.status)) {
+          throw err;
+        }
+        lastError = err;
+      } else {
+        const xml = await response.text();
+        const parsed = await parser.parseString(xml);
+        return {
+          feed,
+          items: parsed.items ?? [],
+        };
+      }
+    } catch (err) {
+      lastError = err;
+    }
+
+    if (attempt < maxAttempts) {
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+    }
   }
 
-  const xml = await response.text();
-  const parsed = await parser.parseString(xml);
-  return {
-    feed,
-    items: parsed.items ?? [],
-  };
+  throw lastError;
 }
 
 async function collectNewArticles(sentLinks) {
@@ -266,7 +319,7 @@ async function collectNewArticles(sentLinks) {
 
       const snippet = stripHtml(
         item.contentSnippet || item.content || item.summary || ""
-      ).slice(0, 360);
+      ).slice(0, 180);
 
       newArticles.push({
         title: stripHtml(item.title || "Untitled"),
@@ -292,6 +345,39 @@ async function collectNewArticles(sentLinks) {
   };
 }
 
+function selectBalancedCandidates(articles, maxTotal = 60) {
+  const byCategory = new Map();
+  for (const article of articles) {
+    if (!byCategory.has(article.categoryHint)) {
+      byCategory.set(article.categoryHint, []);
+    }
+    byCategory.get(article.categoryHint).push(article);
+  }
+
+  const selected = [];
+  const selectedUrls = new Set();
+  const perCategoryCap = Math.max(1, Math.floor(maxTotal / Math.max(1, byCategory.size)));
+
+  for (const list of byCategory.values()) {
+    for (const item of list.slice(0, perCategoryCap)) {
+      selected.push(item);
+      selectedUrls.add(item.normalizedUrl);
+    }
+  }
+
+  if (selected.length < maxTotal) {
+    for (const item of articles) {
+      if (selected.length >= maxTotal) break;
+      if (!selectedUrls.has(item.normalizedUrl)) {
+        selected.push(item);
+        selectedUrls.add(item.normalizedUrl);
+      }
+    }
+  }
+
+  return selected;
+}
+
 async function curateWithGemini({ apiKey, model, articles }) {
   const todayLabel = new Intl.DateTimeFormat("id-ID", {
     timeZone: "Asia/Jakarta",
@@ -301,8 +387,8 @@ async function curateWithGemini({ apiKey, model, articles }) {
     year: "numeric",
   }).format(new Date());
 
-  // Cap payload size to keep prompt fast and within context budget.
-  const candidates = articles.slice(0, 60).map((a, idx) => ({
+  // Cap and balance payload across categories so prompt stays fast and avoids timeouts.
+  const candidates = selectBalancedCandidates(articles, 30).map((a, idx) => ({
     index: idx + 1,
     title: a.title,
     url: a.url,
@@ -316,8 +402,8 @@ async function curateWithGemini({ apiKey, model, articles }) {
 Hari ini: ${todayLabel} (WIB).
 
 Dari daftar artikel di bawah ini, lakukan kurasi dengan aturan ketat berikut:
-1. Pilih maksimal 6–7 berita paling berdampak, relevan, dan bernilai tinggi bagi engineer. Buang clickbait, tutorial dasar/pemula, promosi kosong, dan topik duplikat.
-2. Kelompokkan berita terpilih ke dalam 3 kategori berikut (jika satu kategori tidak memiliki berita layak, jangan paksakan isi atau tampilkan catatan singkat):
+1. Pilih **Top 3 berita paling berdampak per kategori** (maksimal 9 berita total, dan minimal 3 berita teratas secara keseluruhan selama tersedia ≥3 kandidat relevan — jangan hanya mengirim 1 berita!). Buang clickbait, tutorial dasar/pemula yang terlalu dangkal, promosi kosong, dan topik duplikat.
+2. Kelompokkan berita terpilih ke dalam 3 kategori berikut (usahakan tiap kategori berisi 2–3 berita terbaik; jika satu kategori benar-benar minim kandidat layak, tetap tampilkan kategori lain dengan minimal total ≥3 berita):
    - 🤖 AI & LLM Radar
    - ⚛️ Frontend: React & Next.js
    - 🟢 Backend: Node.js & JS Ecosystem
@@ -329,7 +415,7 @@ Dari daftar artikel di bawah ini, lakukan kurasi dengan aturan ketat berikut:
    - Container utama max-width: 600px, margin: 0 auto, font-family sans-serif modern (-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif), line-height nyaman dibaca di HP maupun desktop.
    - Warna bersih, kontras tinggi, padding rapi, border-radius halus, dan header singkat "Daily Tech Briefing — ${todayLabel}".
    - Jangan gunakan external stylesheet atau script.
-5. Masukkan SEMUA URL asli (persis seperti di input \`url\`) dari artikel yang kamu pilih ke dalam array \`selectedUrls\`. Jangan sertakan URL yang tidak ada di daftar input.
+5. Pastikan SEMUA URL asli (persis seperti di input \`url\`) dari artikel yang tampil di HTML dimasukkan ke dalam array \`selectedUrls\`, dan hanya tampilkan di HTML artikel yang ada di \`selectedUrls\`. Jangan sertakan URL yang tidak ada di daftar input.
 
 Kembalikan HANYA JSON valid dengan struktur persis:
 {
@@ -418,6 +504,9 @@ ${JSON.stringify(candidates, null, 2)}`;
         console.warn(
           `Warning: ${candidateModel} failed (attempt ${attempt}/${maxAttempts}): ${err?.message || err}`
         );
+        if (err?.name === "TimeoutError") {
+          break;
+        }
       }
 
       if (attempt < maxAttempts) {
